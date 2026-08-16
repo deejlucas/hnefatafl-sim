@@ -28,7 +28,17 @@ def main():
     ap.add_argument("--iters", type=int)
     ap.add_argument("--games-per-iter", type=int)
     ap.add_argument("--workers", type=int)
-    ap.add_argument("--sims", type=int)
+    ap.add_argument("--sims", type=int,
+                    help="self-play AND gating search budget; keep at or "
+                         "above the ~100 legal moves at a typical root, or "
+                         "the root visit counts tie and every game shuffles "
+                         "to a draw")
+    ap.add_argument("--arena-sims", type=int,
+                    help="gating search budget alone, overriding --sims.  "
+                         "Raising self-play sims pays for itself (games "
+                         "resolve sooner), but gating games stay long, so "
+                         "a large --sims costs ~2.6x here for no measured "
+                         "gain in what the gate can tell apart")
     ap.add_argument("--channels", type=int)
     ap.add_argument("--blocks", type=int)
     ap.add_argument("--gate-every", type=int)
@@ -65,6 +75,8 @@ def main():
     if args.sims is not None:
         cfg.selfplay.sims = args.sims
         cfg.arena.sims = args.sims
+    if args.arena_sims is not None:      # after --sims, so it wins
+        cfg.arena.sims = args.arena_sims
     if args.move_limit is not None:
         cfg.selfplay.move_limit = args.move_limit
         cfg.arena.move_limit = args.move_limit
