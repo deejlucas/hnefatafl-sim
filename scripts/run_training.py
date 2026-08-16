@@ -46,9 +46,8 @@ def main():
         cfg.gate_pairs = 4
         cfg.min_buffer = 500
         cfg.selfplay.sims = 64
-        cfg.selfplay.move_limit = 150
-        cfg.arena.sims = 64
-        cfg.arena.move_limit = 150
+        cfg.selfplay.draw_penalty = 0.1   # weak play is draw-heavy; keep the
+        cfg.arena.sims = 64               # value target off the constant 0
     for name, dst in (("iters", "iters"), ("games_per_iter", "games_per_iter"),
                       ("workers", "workers"), ("channels", "channels"),
                       ("blocks", "blocks"), ("gate_every", "gate_every")):

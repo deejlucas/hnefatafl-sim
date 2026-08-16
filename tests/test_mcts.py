@@ -19,7 +19,8 @@ from tafl.eval import ArenaConfig, elo_diff, play_match
 from tafl.mcts import MCTS, terminal_value
 from tafl.net import NetEvaluator, PolicyValueNet
 from tafl.selfplay import SelfPlayConfig, play_game, sample_planes
-from tafl.train import ReplayBuffer, TrainConfig, Trainer
+from tafl.selfplay import generate_games
+from tafl.train import ReplayBuffer, TrainConfig, Trainer, run_training
 
 torch.manual_seed(0)
 
@@ -212,6 +213,59 @@ def test_training_reduces_loss(one_game):
     after = trainer.train_steps(buffer, 2)
     assert after["policy_loss"] < before["policy_loss"]
     assert after["value_loss"] < before["value_loss"]
+
+
+def test_cpu_state_dict_is_a_snapshot(one_game):
+    """Regression: on a CPU trainer, .cpu() aliases the live parameters, so
+    without an explicit clone the stored 'best' weights would mutate under
+    training and gating would compare the net to itself."""
+    rec, _ = one_game
+    torch.manual_seed(0)
+    cfg = TrainConfig(channels=16, blocks=1, batch_size=32, lr=3e-3)
+    trainer = Trainer(cfg, device=torch.device("cpu"))
+    snapshot = trainer.cpu_state_dict()
+    buffer = ReplayBuffer(10_000)
+    buffer.add_game(rec)
+    trainer.train_steps(buffer, 5)
+    live = trainer.net.state_dict()
+    assert any(not torch.equal(snapshot[k], live[k].cpu())
+               for k in snapshot if live[k].is_floating_point())
+
+
+def test_run_training_end_to_end(tmp_path):
+    """One full iteration through the real loop: multiprocess self-play,
+    training on the default device, a multiprocess gate, checkpoints, log."""
+    import json
+    cfg = TrainConfig(channels=8, blocks=1, iters=1, games_per_iter=2,
+                      workers=2, min_buffer=1, batch_size=16,
+                      gate_every=1, gate_pairs=2)
+    cfg.selfplay.sims = 8
+    cfg.selfplay.batch_size = 4
+    cfg.selfplay.temp_plies = 4
+    cfg.selfplay.move_limit = 30
+    cfg.arena.sims = 8
+    cfg.arena.batch_size = 4
+    cfg.arena.move_limit = 20
+    best = run_training(cfg, tmp_path / "run", models_dir=tmp_path / "models")
+    assert best.exists()
+    assert (tmp_path / "models" / "ckpt_0001.pt").exists()
+    (line,) = (tmp_path / "run" / "log.jsonl").read_text().splitlines()
+    entry = json.loads(line)
+    assert entry["games"] == 2 and entry["steps"] > 0
+    assert 0.0 <= entry["gate_score"] <= 1.0
+    assert "as_att" in entry["gate"] and "as_def" in entry["gate"]
+
+
+def test_generate_games_multiprocess():
+    torch.manual_seed(0)
+    net = PolicyValueNet(channels=8, blocks=1)
+    from tafl.selfplay import SelfPlayConfig
+    cfg = SelfPlayConfig(sims=8, batch_size=4, temp_plies=4, move_limit=20)
+    sd = {k: v.cpu() for k, v in net.state_dict().items()}
+    recs = generate_games(sd, net.net_config(), cfg, n_games=3, workers=2,
+                          seed=1)
+    assert len(recs) == 3
+    assert all(r.result is not None and r.plies > 0 for r in recs)
 
 
 # --- arena -----------------------------------------------------------------

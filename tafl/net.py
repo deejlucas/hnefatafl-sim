@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .engine import MOVES_PER_SQ, N, N_SQ, State, encode, legal_actions
+from .engine import MOVES_PER_SQ, N_SQ, State, encode, legal_actions
 
 
 def best_device() -> torch.device:

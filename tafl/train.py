@@ -13,7 +13,6 @@ runs on MPS when available; self-play workers stay on CPU (see selfplay.py).
 
 from __future__ import annotations
 
-import copy
 import json
 import time
 from collections import Counter, deque
@@ -24,9 +23,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .engine import ATT, DEF, N_ACTIONS
-from .eval import ArenaConfig, elo_diff, play_match
-from .net import NetEvaluator, PolicyValueNet, best_device, save_checkpoint
+from .engine import ATT, N_ACTIONS
+from .eval import ArenaConfig, elo_diff, play_match_mp
+from .net import PolicyValueNet, best_device, save_checkpoint
 from .selfplay import (GameRecord, Sample, SelfPlayConfig, generate_games,
                        sample_planes)
 
@@ -37,7 +36,7 @@ class TrainConfig:
     blocks: int = 6
     iters: int = 200
     games_per_iter: int = 24
-    workers: int = 6
+    workers: int = 8               # self-play + gating processes (perf cores)
     buffer_capacity: int = 250_000       # positions (~1000 games)
     min_buffer: int = 2_000              # start training once this full
     batch_size: int = 256
@@ -110,14 +109,11 @@ class Trainer:
                 "steps": n_steps}
 
     def cpu_state_dict(self):
-        return {k: v.detach().cpu() for k, v in self.net.state_dict().items()}
-
-
-def _cpu_net(state_dict, cfg: TrainConfig) -> PolicyValueNet:
-    net = PolicyValueNet(cfg.channels, cfg.blocks)
-    net.load_state_dict(state_dict)
-    net.eval()
-    return net
+        """Snapshot of the weights on CPU.  The .clone() matters: .cpu() is a
+        no-op alias when training runs on CPU, and gating/promotion must hold
+        a frozen copy, not references to the live parameters."""
+        return {k: v.detach().cpu().clone()
+                for k, v in self.net.state_dict().items()}
 
 
 def selfplay_stats(records: list[GameRecord]) -> dict:
@@ -182,13 +178,13 @@ def run_training(cfg: TrainConfig, run_dir: str | Path,
 
         if it % cfg.gate_every == 0 and metrics["steps"] > 0:
             t2 = time.perf_counter()
-            cand = NetEvaluator(_cpu_net(trainer.cpu_state_dict(), cfg),
-                                torch.device("cpu"))
-            best = NetEvaluator(_cpu_net(best_sd, cfg), torch.device("cpu"))
-            match = play_match(cand, best, cfg.gate_pairs, cfg.arena,
-                               seed=cfg.seed * 104_729 + it)
+            match = play_match_mp(trainer.cpu_state_dict(), best_sd,
+                                  trainer.net.net_config(), cfg.gate_pairs,
+                                  cfg.arena, workers=cfg.workers,
+                                  seed=cfg.seed * 104_729 + it)
             entry["gate_score"] = match.score_rate
             entry["gate_elo"] = round(elo_diff(match.score_rate), 1)
+            entry["gate"] = match.summary()
             entry["gate_sec"] = round(time.perf_counter() - t2, 1)
             if match.score_rate >= cfg.gate_win:
                 best_sd = trainer.cpu_state_dict()
@@ -208,7 +204,7 @@ def run_training(cfg: TrainConfig, run_dir: str | Path,
               f"p_loss={metrics['policy_loss']} v_loss={metrics['value_loss']} "
               f"sp={sp_time:.0f}s tr={tr_time:.0f}s "
               f"winners={stats['winners']}"
-              + (f" gate={entry.get('gate_score'):.2f}"
+              + (f" gate={entry['gate_score']:.2f} {entry['gate']}"
                  if "gate_score" in entry else ""),
               flush=True)
     return best_path

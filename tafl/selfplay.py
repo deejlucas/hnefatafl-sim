@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .engine import ATT, MOVE_LIMIT, N, Result, apply, initial_state
+from .engine import ATT, MOVE_LIMIT, N, Result, initial_state
 from .mcts import MCTS
 
 
@@ -32,7 +32,10 @@ class SelfPlayConfig:
     dirichlet_alpha: float = 0.1   # ~10 / typical branching factor (~110)
     dirichlet_eps: float = 0.25
     temp_plies: int = 20           # sample moves with τ=1 this long, then argmax
-    move_limit: int = MOVE_LIMIT
+    move_limit: int = MOVE_LIMIT   # NB: encode()'s move-count plane is always
+                                   # normalized by the engine MOVE_LIMIT (300);
+                                   # train and serve at the same limit or the
+                                   # net's horizon plane is miscalibrated
     draw_penalty: float = 0.0      # z = -penalty for both sides on draws
 
 

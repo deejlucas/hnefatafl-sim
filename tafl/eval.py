@@ -13,6 +13,7 @@ No Dirichlet noise is used in arena games.
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -43,6 +44,19 @@ class MatchResult:
     def score_rate(self) -> float:
         return self.score_a / self.games if self.games else 0.5
 
+    def summary(self) -> dict:
+        """Win/draw/loss breakdown per color for agent A, for logging --
+        a 0.5 score rate from all draws and one from split wins are very
+        different diagnostics."""
+        def wdl(results, side):
+            w = sum(1 for r in results if r.winner == side)
+            d = sum(1 for r in results if r.winner is None)
+            return {"w": w, "d": d, "l": len(results) - w - d}
+        return {"as_att": wdl(self.a_as_att, ATT),
+                "as_def": wdl(self.a_as_def, DEF),
+                "avg_len": round(float(np.mean(self.lengths)), 1)
+                if self.lengths else 0.0}
+
 
 def play_game(ev_att, ev_def, cfg: ArenaConfig,
               rng: np.random.Generator) -> tuple[Result, int]:
@@ -72,25 +86,92 @@ def play_game(ev_att, ev_def, cfg: ArenaConfig,
     return st.result, st.ply
 
 
+def _play_pair(ev_a, ev_b, cfg: ArenaConfig, seed: int):
+    """One color-balanced pair.  Returns [(a_side, result, plies), ...]."""
+    rng = np.random.default_rng(seed)
+    out = []
+    result, plies = play_game(ev_a, ev_b, cfg, rng)
+    out.append((ATT, result, plies))
+    result, plies = play_game(ev_b, ev_a, cfg, rng)
+    out.append((DEF, result, plies))
+    return out
+
+
+def _tally(out: MatchResult, games):
+    for a_side, result, plies in games:
+        (out.a_as_att if a_side == ATT else out.a_as_def).append(result)
+        if result.winner is None:
+            out.score_a += 0.5
+        elif result.winner == a_side:
+            out.score_a += 1.0
+        out.games += 1
+        out.lengths.append(plies)
+
+
+def _pair_seeds(pairs: int, seed: int):
+    return [seed * 1_000_003 + k for k in range(pairs)]
+
+
 def play_match(ev_a, ev_b, pairs: int, cfg: ArenaConfig,
                seed: int = 0) -> MatchResult:
     """`pairs` color-balanced game pairs between agents A and B."""
     out = MatchResult()
-    for k in range(pairs):
-        rng = np.random.default_rng(seed * 1_000_003 + k)
-        for a_side in (ATT, DEF):
-            if a_side == ATT:
-                result, plies = play_game(ev_a, ev_b, cfg, rng)
-                out.a_as_att.append(result)
-            else:
-                result, plies = play_game(ev_b, ev_a, cfg, rng)
-                out.a_as_def.append(result)
-            if result.winner is None:
-                out.score_a += 0.5
-            elif result.winner == a_side:
-                out.score_a += 1.0
-            out.games += 1
-            out.lengths.append(plies)
+    for s in _pair_seeds(pairs, seed):
+        _tally(out, _play_pair(ev_a, ev_b, cfg, s))
+    return out
+
+
+def _match_worker(sd_a, sd_b, net_config, cfg, seeds, queue):
+    import torch
+    torch.set_num_threads(1)
+    from .net import NetEvaluator, PolicyValueNet
+
+    def make(sd):
+        net = PolicyValueNet(**net_config)
+        net.load_state_dict(sd)
+        return NetEvaluator(net, torch.device("cpu"))
+
+    ev_a, ev_b = make(sd_a), make(sd_b)
+    for s in seeds:
+        queue.put(_play_pair(ev_a, ev_b, cfg, s))
+
+
+def play_match_mp(sd_a, sd_b, net_config: dict, pairs: int, cfg: ArenaConfig,
+                  workers: int = 1, seed: int = 0) -> MatchResult:
+    """`play_match` from CPU state dicts, with pairs fanned out over worker
+    processes so gating does not serialize the training loop (a full gate at
+    default settings costs minutes of otherwise-idle CPU time)."""
+    seeds = _pair_seeds(pairs, seed)
+    out = MatchResult()
+    workers = min(workers, pairs)
+    if workers <= 1:
+        import torch
+        from .net import NetEvaluator, PolicyValueNet
+
+        def make(sd):
+            net = PolicyValueNet(**net_config)
+            net.load_state_dict(sd)
+            return NetEvaluator(net, torch.device("cpu"))
+        ev_a, ev_b = make(sd_a), make(sd_b)
+        for s in seeds:
+            _tally(out, _play_pair(ev_a, ev_b, cfg, s))
+        return out
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = []
+    for i in range(workers):
+        chunk = seeds[i::workers]
+        if not chunk:
+            continue
+        p = ctx.Process(target=_match_worker,
+                        args=(sd_a, sd_b, net_config, cfg, chunk, queue),
+                        daemon=True)
+        p.start()
+        procs.append(p)
+    for _ in range(pairs):
+        _tally(out, queue.get())
+    for p in procs:
+        p.join()
     return out
 
 
