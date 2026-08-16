@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .engine import ATT, DEF, MOVE_LIMIT, Result, initial_state
+from .engine import ATT, DEF, MOVE_LIMIT, Result, apply, initial_state
 from .mcts import MCTS
 
 
@@ -179,3 +179,117 @@ def elo_diff(score_rate: float) -> float:
     """Elo difference implied by a score rate, clamped to +-800."""
     s = min(max(score_rate, 1e-3), 1 - 1e-3)
     return max(-800.0, min(800.0, 400.0 * math.log10(s / (1.0 - s))))
+
+
+# --- agent-vs-agent games (Phase 3 calibration, balance study, web app) ----
+#
+# The matches above pit two *evaluators* against each other at one shared
+# search configuration -- exactly what gating needs.  Calibration instead
+# compares agents that differ in checkpoint, search budget and randomness,
+# and some of them (the heuristic baseline) have no network at all, so the
+# driver below talks to the `tafl.agents.Agent` protocol instead.
+
+@dataclass
+class AgentMatchConfig:
+    opening_plies: int = 8         # plies played at `opening_temperature`
+    opening_temperature: float = 0.7
+    move_limit: int = MOVE_LIMIT
+
+
+def play_agent_game(agent_att, agent_def,
+                    cfg: AgentMatchConfig | None = None) -> tuple[Result, int]:
+    """One game between two agents.  Returns (result, plies)."""
+    cfg = cfg or AgentMatchConfig()
+    agents = {ATT: agent_att, DEF: agent_def}
+    for a in agents.values():
+        a.new_game()
+    st = initial_state()
+    while st.result is None:
+        temp = (cfg.opening_temperature if st.ply < cfg.opening_plies
+                else None)
+        action = agents[st.to_move].select_action(st, temperature=temp)
+        st = apply(st, action, cfg.move_limit)
+        for a in agents.values():
+            a.observe(action)
+    return st.result, st.ply
+
+
+@dataclass(frozen=True)
+class Job:
+    """One scheduled agent-vs-agent game.
+
+    `key` is any hashable label the caller wants the result tagged with
+    (calibration uses (side, candidate index)); `seed` drives both agents'
+    randomness, so re-using the same seed across candidates makes the
+    comparison paired.
+    """
+    key: tuple
+    spec_att: dict
+    spec_def: dict
+    seed: int
+
+
+def _run_job(job: Job, models_dir, cfg: AgentMatchConfig) -> dict:
+    from .agents import make_agent
+    a = make_agent(job.spec_att, models_dir,
+                   rng=np.random.default_rng(job.seed * 2 + 1),
+                   move_limit=cfg.move_limit)
+    d = make_agent(job.spec_def, models_dir,
+                   rng=np.random.default_rng(job.seed * 2 + 2),
+                   move_limit=cfg.move_limit)
+    result, plies = play_agent_game(a, d, cfg)
+    return {"key": job.key, "winner": result.winner, "reason": result.reason,
+            "plies": plies, "seed": job.seed}
+
+
+def _job_worker(jobs, models_dir, cfg, queue):
+    import torch
+    torch.set_num_threads(1)
+    for job in jobs:
+        queue.put(_run_job(job, models_dir, cfg))
+
+
+def run_jobs(jobs: list[Job], models_dir="models",
+             cfg: AgentMatchConfig | None = None, workers: int = 1,
+             on_result=None) -> list[dict]:
+    """Play every job, fanned out over `workers` processes.
+
+    Agents are rebuilt per job but network checkpoints are cached per
+    process (see `agents.evaluator_for`), so the load cost is paid once.
+    """
+    cfg = cfg or AgentMatchConfig()
+    models_dir = str(models_dir)
+    out = []
+    if workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            r = _run_job(job, models_dir, cfg)
+            out.append(r)
+            if on_result:
+                on_result(r)
+        return out
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = []
+    for i in range(min(workers, len(jobs))):
+        chunk = jobs[i::workers]
+        if not chunk:
+            continue
+        p = ctx.Process(target=_job_worker,
+                        args=(chunk, models_dir, cfg, queue), daemon=True)
+        p.start()
+        procs.append(p)
+    for _ in range(len(jobs)):
+        r = queue.get()
+        out.append(r)
+        if on_result:
+            on_result(r)
+    for p in procs:
+        p.join()
+    return out
+
+
+def score_for(side: int, result_winner) -> float:
+    """Match points for `side`: 1 win, 0.5 draw, 0 loss."""
+    if result_winner is None:
+        return 0.5
+    return 1.0 if result_winner == side else 0.0
