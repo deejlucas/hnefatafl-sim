@@ -35,7 +35,11 @@ from .eval import AgentMatchConfig, Job, run_jobs, score_for
 
 @dataclass
 class CalibrationConfig:
-    games: int = 4                 # games per (candidate, panel opponent)
+    # A candidate's score comes from `games * len(panel)` games per side;
+    # its standard error is roughly sqrt(0.25 / that).  At games=8 (32
+    # games/side, SE ~0.09) a min_margin miss is still noise-dominated:
+    # treat warnings as "re-run with more games", not as a verdict.
+    games: int = 8                 # games per (candidate, panel opponent)
     min_margin: float = 0.05       # required score gap between levels
     workers: int = 8
     seed: int = 0
@@ -221,15 +225,18 @@ def calibrate(models_dir="models", cfg: CalibrationConfig | None = None,
                            for k in ("w", "d", "l", "games")}
             ladder.append(s)
             if gap is not None and gap < cfg.min_margin:
+                n = stats[(side, ci)]["games"]
                 warnings.append(
                     f"{side_name(side)} level {lvl} ({describe_spec(s)}) beats "
-                    f"level {lvl - 1} by only {gap:+.3f} "
-                    f"(< min_margin {cfg.min_margin})")
+                    f"level {lvl - 1} by only {gap:+.3f} over {n} games/side "
+                    f"(< min_margin {cfg.min_margin}; score SE at that n is "
+                    f"~{(0.25 / max(n, 1)) ** 0.5:.3f})")
         ladders[side_name(side)] = ladder
         evidence[side_name(side)] = [
             {**candidates[ci], "panel_score": round(rates[ci], 4),
              "record": {k: stats[(side, ci)][k] for k in ("w", "d", "l")},
-             "avg_len": round(stats[(side, ci)]["avg_len"], 1)}
+             "avg_len": round(stats[(side, ci)]["avg_len"], 1),
+             "reasons": stats[(side, ci)]["reasons"]}
             for ci in range(len(candidates))]
 
     panels = {side_name(ATT): panel, side_name(DEF): panel}

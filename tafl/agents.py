@@ -229,6 +229,10 @@ class MCTSAgent(Agent):
                  name: str = "mcts", **kw):
         super().__init__(name=name, **kw)
         self.sims = int(sims)
+        if self.sims < 1:
+            # with zero sims the root has no visits and root_policy would
+            # degenerate to "always the first legal move"; use PolicyAgent
+            raise ValueError("MCTSAgent needs sims >= 1")
         self.move_limit = move_limit
         self.mcts = MCTS(evaluator, c_puct=c_puct, dirichlet_eps=0.0,
                          batch_size=batch_size, move_limit=move_limit,
@@ -317,7 +321,12 @@ _EVALUATOR_CACHE: dict = {}
 
 
 def evaluator_for(path, device=None):
-    """Cached `NetEvaluator` for a checkpoint (one per path per process)."""
+    """Cached `NetEvaluator` for a checkpoint (one per path per process).
+
+    The cache never re-reads a file, so a process that outlives a training
+    run overwriting `best.pt` would keep serving the old weights; call
+    `clear_evaluator_cache()` after the file changes.
+    """
     import torch
     from .net import NetEvaluator, load_checkpoint
     dev = torch.device(device) if device is not None else torch.device("cpu")
@@ -462,7 +471,7 @@ def build_levels(ladders: dict, panels: dict, meta: dict | None = None) -> dict:
             **(meta or {})}
 
 
-def default_ladder(ckpts: list[CheckpointInfo], sims=(0, 25, 100, 400),
+def default_ladder(ckpts: list[CheckpointInfo], sims=(25, 400),
                    randomness=(0.6, 0.25, 0.0)) -> list[dict]:
     """Uncalibrated fallback ladder, weakest first.
 
@@ -478,8 +487,8 @@ def default_ladder(ckpts: list[CheckpointInfo], sims=(0, 25, 100, 400),
     out = [spec("policy", first, randomness=randomness[0], temperature=1.0),
            spec("policy", first, randomness=randomness[1], temperature=1.0),
            spec("policy", mid, randomness=randomness[2], temperature=0.6),
-           spec("mcts", best, sims=sims[1]),
-           spec("mcts", best, sims=sims[3])]
+           spec("mcts", best, sims=sims[0]),
+           spec("mcts", best, sims=sims[1])]
     return out
 
 

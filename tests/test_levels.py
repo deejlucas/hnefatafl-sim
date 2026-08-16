@@ -204,6 +204,13 @@ def test_evaluator_cache_is_shared_between_agents(models):
     assert a.mcts.evaluator is b.evaluator
 
 
+def test_mcts_agent_rejects_zero_sims(models):
+    """sims=0 would leave the root visitless and root_policy degenerate
+    (argmax over zeros = always the first legal move)."""
+    with pytest.raises(ValueError, match="sims"):
+        make_agent(spec("mcts", "best.pt", sims=0), models)
+
+
 def test_make_agent_dispatch(models):
     assert isinstance(make_agent(spec("random"), models), RandomAgent)
     assert isinstance(make_agent(spec("heuristic"), models), HeuristicAgent)
@@ -310,6 +317,18 @@ def test_run_jobs_multiprocess(models):
     assert len(res) == 4
     assert {r["key"] for r in res} == {(ATT, i) for i in range(4)}
     assert all(0 < r["plies"] <= 30 for r in res)
+
+
+def test_run_jobs_raises_when_a_worker_dies(models, monkeypatch):
+    """A crashed worker must surface as an error, not hang the run
+    (the overnight gate and the calibration both drain this queue)."""
+    import tafl.eval as ev
+    monkeypatch.setattr(ev, "WORKER_POLL_SEC", 0.2)
+    cfg = AgentMatchConfig(move_limit=30, opening_plies=4)
+    jobs = [Job((ATT, i), spec("policy", "missing.pt"), spec("random"), seed=i)
+            for i in range(2)]
+    with pytest.raises(RuntimeError, match="worker"):
+        run_jobs(jobs, models, cfg, workers=2)
 
 
 def test_jobs_are_paired_across_candidates():

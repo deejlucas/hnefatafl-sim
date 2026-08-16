@@ -33,8 +33,16 @@ def main():
     ap.add_argument("--blocks", type=int)
     ap.add_argument("--gate-every", type=int)
     ap.add_argument("--move-limit", type=int)
+    ap.add_argument("--draw-penalty", type=float,
+                    help="self-play value target for draws is -penalty for "
+                         "both sides; keeps the value head off a constant 0 "
+                         "when self-play is draw-heavy (smoke run was ~75%% "
+                         "draws)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run-dir", default=None)
+    ap.add_argument("--models-dir", default="models",
+                    help="where checkpoints land; a fresh run OVERWRITES "
+                         "best.pt there, so point smoke/test runs elsewhere")
     args = ap.parse_args()
 
     cfg = TrainConfig(seed=args.seed)
@@ -60,9 +68,11 @@ def main():
     if args.move_limit is not None:
         cfg.selfplay.move_limit = args.move_limit
         cfg.arena.move_limit = args.move_limit
+    if args.draw_penalty is not None:
+        cfg.selfplay.draw_penalty = args.draw_penalty
 
     run_dir = args.run_dir or time.strftime("runs/%Y%m%d-%H%M%S")
-    best = run_training(cfg, run_dir)
+    best = run_training(cfg, run_dir, models_dir=args.models_dir)
     print(f"done; best checkpoint: {best}")
 
 
