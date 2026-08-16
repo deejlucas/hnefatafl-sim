@@ -3,3 +3,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+runs/
+models/*
+!models/levels.json
+.vscode/
