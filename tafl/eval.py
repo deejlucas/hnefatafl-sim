@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import multiprocessing as mp
+import queue as queue_mod
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -112,6 +113,41 @@ def _pair_seeds(pairs: int, seed: int):
     return [seed * 1_000_003 + k for k in range(pairs)]
 
 
+WORKER_POLL_SEC = 10.0
+
+
+def _drain(queue, procs, n: int):
+    """Yield `n` results from `queue`, raising instead of hanging forever
+    if a worker process dies before delivering its share.  Results a dead
+    worker already queued are still drained first (`get` only times out
+    once the queue is empty)."""
+    got = 0
+    while got < n:
+        try:
+            r = queue.get(timeout=WORKER_POLL_SEC)
+        except queue_mod.Empty:
+            dead = [p.exitcode for p in procs
+                    if not p.is_alive() and p.exitcode != 0]
+            if dead:
+                raise RuntimeError(
+                    f"match worker died (exitcode {dead[0]}) after "
+                    f"{got}/{n} results") from None
+            if all(not p.is_alive() for p in procs):
+                raise RuntimeError(
+                    f"all match workers exited but only {got}/{n} "
+                    f"results arrived") from None
+            continue
+        got += 1
+        yield r
+
+
+def _shutdown(procs, error: bool):
+    for p in procs:
+        if error:
+            p.terminate()
+        p.join()
+
+
 def play_match(ev_a, ev_b, pairs: int, cfg: ArenaConfig,
                seed: int = 0) -> MatchResult:
     """`pairs` color-balanced game pairs between agents A and B."""
@@ -168,10 +204,13 @@ def play_match_mp(sd_a, sd_b, net_config: dict, pairs: int, cfg: ArenaConfig,
                         daemon=True)
         p.start()
         procs.append(p)
-    for _ in range(pairs):
-        _tally(out, queue.get())
-    for p in procs:
-        p.join()
+    try:
+        for games in _drain(queue, procs, pairs):
+            _tally(out, games)
+    except BaseException:
+        _shutdown(procs, error=True)
+        raise
+    _shutdown(procs, error=False)
     return out
 
 
@@ -278,13 +317,15 @@ def run_jobs(jobs: list[Job], models_dir="models",
                         args=(chunk, models_dir, cfg, queue), daemon=True)
         p.start()
         procs.append(p)
-    for _ in range(len(jobs)):
-        r = queue.get()
-        out.append(r)
-        if on_result:
-            on_result(r)
-    for p in procs:
-        p.join()
+    try:
+        for r in _drain(queue, procs, len(jobs)):
+            out.append(r)
+            if on_result:
+                on_result(r)
+    except BaseException:
+        _shutdown(procs, error=True)
+        raise
+    _shutdown(procs, error=False)
     return out
 
 

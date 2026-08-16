@@ -9,10 +9,12 @@ Quick pipeline check on smoke checkpoints (~minutes):
     .venv/bin/python scripts/calibrate_levels.py --smoke
 
 Real calibration after the overnight run:
-    .venv/bin/python scripts/calibrate_levels.py --games 6 --workers 8
+    .venv/bin/python scripts/calibrate_levels.py --games 12 --workers 8
 
-Costs 2 sides x candidates x panel x --games games, so the default is
-already a few hundred games; --dry-run prints the schedule without playing.
+Costs 2 sides x candidates x panel x --games games (--dry-run prints the
+schedule without playing).  A candidate's score SE is ~sqrt(0.25 / games
+per side), so small --games values cannot certify min_margin-sized steps:
+treat sub-margin warnings at low counts as "re-run with more games".
 """
 
 import argparse
