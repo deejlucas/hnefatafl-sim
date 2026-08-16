@@ -116,6 +116,15 @@ class Trainer:
                 for k, v in self.net.state_dict().items()}
 
 
+def write_meta(ckpt_path: Path, entry: dict):
+    """Sidecar `<ckpt>.json` (games seen, eval Elo, timestamp) so tools can
+    read a checkpoint's provenance without loading its weights."""
+    meta = {k: v for k, v in entry.items()
+            if isinstance(v, (int, float, str, bool, dict)) or v is None}
+    meta["saved_at"] = time.time()
+    ckpt_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+
+
 def selfplay_stats(records: list[GameRecord]) -> dict:
     reasons = Counter(r.result.reason for r in records)
     winners = Counter("draw" if r.result.winner is None
@@ -144,6 +153,7 @@ def run_training(cfg: TrainConfig, run_dir: str | Path,
     best_sd = trainer.cpu_state_dict()
     best_path = models_dir / "best.pt"
     save_checkpoint(trainer.net, best_path, iter=0, games=0)
+    write_meta(best_path, {"iter": 0, "total_games": 0, "promoted": True})
     total_games = 0
     print(f"training on {trainer.device}, self-play on {cfg.workers} "
           f"CPU workers, run dir {run_dir}", flush=True)
@@ -192,11 +202,10 @@ def run_training(cfg: TrainConfig, run_dir: str | Path,
                                 games=total_games,
                                 gate_score=match.score_rate)
                 entry["promoted"] = True
+                write_meta(best_path, entry)
             ckpt = models_dir / f"ckpt_{it:04d}.pt"
             save_checkpoint(trainer.net, ckpt, iter=it, games=total_games)
-            meta = {k: v for k, v in entry.items()
-                    if isinstance(v, (int, float, str, bool, dict))}
-            ckpt.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+            write_meta(ckpt, entry)
 
         with log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
