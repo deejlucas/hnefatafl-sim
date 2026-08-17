@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import queue as queue_mod
+from collections import Counter
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -25,7 +26,10 @@ from .mcts import MCTS
 
 @dataclass
 class ArenaConfig:
-    sims: int = 100
+    sims: int = 150                # keep at or above the ~100 legal moves at
+                                   # a typical root: below that PUCT fans out
+                                   # instead of concentrating, root visits end
+                                   # up tied, and every game shuffles to a draw
     batch_size: int = 8
     c_puct: float = 1.5
     temp_plies: int = 8            # opening variety
@@ -48,13 +52,17 @@ class MatchResult:
     def summary(self) -> dict:
         """Win/draw/loss breakdown per color for agent A, for logging --
         a 0.5 score rate from all draws and one from split wins are very
-        different diagnostics."""
+        different diagnostics.  `reasons` separates those draws further:
+        a match that is all repetition/move limit means the search never
+        resolved anything, not that the two agents are evenly matched."""
         def wdl(results, side):
             w = sum(1 for r in results if r.winner == side)
             d = sum(1 for r in results if r.winner is None)
             return {"w": w, "d": d, "l": len(results) - w - d}
         return {"as_att": wdl(self.a_as_att, ATT),
                 "as_def": wdl(self.a_as_def, DEF),
+                "reasons": dict(Counter(r.reason for r in
+                                        self.a_as_att + self.a_as_def)),
                 "avg_len": round(float(np.mean(self.lengths)), 1)
                 if self.lengths else 0.0}
 

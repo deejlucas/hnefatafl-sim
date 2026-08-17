@@ -157,8 +157,12 @@ class MCTS:
         root = self.root
         n = root.N.astype(np.float64)
         if temperature < 0.05:
+            # Break ties at random: np.argmax always returns the lowest index,
+            # so a thinly searched root (sims below the legal-move count) picks
+            # by action id rather than by search, and the game loops.
             p = np.zeros_like(n)
-            p[int(np.argmax(n))] = 1.0
+            tied = np.flatnonzero(n == n.max())
+            p[int(self.rng.choice(tied))] = 1.0
         else:
             p = n ** (1.0 / temperature)
             s = p.sum()
