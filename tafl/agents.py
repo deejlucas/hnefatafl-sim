@@ -6,7 +6,7 @@ server, plus the checkpoint registry and `models/levels.json`.
 
 Agents
  - `RandomAgent`      uniform legal moves; the floor of the ladder.
- - `HeuristicAgent`   1-ply search over a material + king-distance
+ - `HeuristicAgent`   1-ply search over a material + king-escape-mobility
                       evaluation; a *fixed* external baseline that never
                       changes as training progresses, so it measures
                       absolute progress (unlike gate scores, which only
@@ -135,9 +135,28 @@ class RandomAgent(Agent):
 # 1-ply evaluation weights, all from the *attacker's* perspective.
 W_ATTACKER = 1.0        # attacker piece
 W_DEFENDER = 2.0        # defender piece (12 defenders vs 24 attackers)
-W_KING_DIST = 0.35      # per step of king distance from the nearest corner
+W_KING_MOVES = 0.5      # per king *move* needed to reach the nearest corner
+KING_TRAPPED = 8        # king-move count charged when no corner is reachable
+W_KING_DIST = 0.35      # per step of Manhattan king-corner distance
+                        # (the legacy "manhattan" metric)
+W_KING_FREE = 0.02      # per square the king can reach at all: the "cage"
+                        # gradient.  Small enough that its full range
+                        # (~120 squares = 2.4) stays near one capture, big
+                        # enough to rank wall-tightening above the 1e-3
+                        # tie-break jitter when nothing else distinguishes
+                        # moves (the failure mode of a trapped-king endgame)
 W_ESCAPE_THREAT = 6.0   # per corner the king can reach in one move
+W_ESCAPE_LOSS = 100.0   # an escape threat the attackers cannot answer:
+                        # defender to move with an open corner, or two open
+                        # corners at once.  Far above any material swing
+                        # (max 24 + the distance term) so the attacker
+                        # prefers even a repetition draw over allowing it,
+                        # yet far below W_WIN so real terminals dominate.
 W_WIN = 1e6
+
+# king-distance metrics selectable per HeuristicAgent, so old and new
+# heuristics can be pitted against each other
+KING_METRICS = ("moves", "manhattan")
 
 
 def king_escape_threats(state: State) -> int:
@@ -153,46 +172,130 @@ def king_escape_threats(state: State) -> int:
     return n
 
 
+def king_reach(state: State, cap: int = KING_TRAPPED) -> tuple[int, int]:
+    """(moves to the nearest corner, squares the king can reach at all),
+    with all other pieces frozen where they stand.
+
+    Breadth-first search (flood fill) over the king's rook moves; the
+    king's own start square counts as vacant because the king has left it
+    by the time it could pass back through.  The first component is `cap`
+    when no corner is reachable; the second is the size of the king's
+    "cage", which gives a 1-ply search a gradient *inside* a trap: walling
+    the king in square by square raises the attacker's score, prying the
+    cage open raises the defender's.
+    """
+    start = state.king
+    b = state.board_b
+    seen = bytearray(len(b))
+    seen[start] = 1
+    frontier = [start]
+    moves = 0
+    corner_moves = 0 if IS_CORNER[start] else None
+    while frontier:
+        moves += 1
+        nxt = []
+        for sq in frontier:
+            for ray in RAYS[sq]:
+                for t in ray:
+                    if b[t] and t != start:
+                        break
+                    if not seen[t]:
+                        seen[t] = 1
+                        if corner_moves is None and IS_CORNER[t]:
+                            corner_moves = min(moves, cap)  # trapped stays
+                        nxt.append(t)                       # the worst case
+        frontier = nxt
+    free = sum(seen) - 1                   # reachable squares, start excluded
+    return (cap if corner_moves is None else corner_moves), free
+
+
+def king_corner_moves(state: State, cap: int = KING_TRAPPED) -> int:
+    """Minimum number of king moves to reach any corner (see `king_reach`);
+    `cap` when no corner is reachable."""
+    return king_reach(state, cap)[0]
+
+
+def king_free_squares(state: State) -> int:
+    """How many squares the king can reach at all (see `king_reach`)."""
+    return king_reach(state)[1]
+
+
 def king_corner_distance(state: State) -> int:
-    """Manhattan distance from the king to the nearest corner."""
+    """Manhattan distance from the king to the nearest corner (the legacy
+    metric: blind to pieces standing in the way)."""
     r, c = divmod(state.king, N)
     return min(r, N - 1 - r) + min(c, N - 1 - c)
 
 
-def heuristic_value(state: State) -> float:
+def heuristic_value(state: State, king_metric: str = "moves") -> float:
     """Static evaluation from the attacker's perspective (+ = attackers better).
 
     Material (defenders weighted double, so the start position scores 0),
-    plus how far the king is from a corner, minus immediate escape threats.
+    plus a king-distance-from-corner term, minus immediate escape threats.
     Terminal positions dominate everything else.
+
+    `king_metric` picks the distance term: "moves" (default) charges
+    `W_KING_MOVES` per actual king move to the nearest corner, so blocking
+    the king's road in -- or clearing it out -- registers in a 1-ply search;
+    it also charges `W_KING_FREE` per square the king can reach at all, so
+    tightening a trapped king's cage (or prying it open) registers even
+    while the corner distance is saturated.  "manhattan" is the legacy
+    piece-blind distance at `W_KING_DIST` per step, with neither refinement.
+
+    Escape threats: under "moves" a threat the attackers cannot answer --
+    the defender is to move with an open corner path, or two corners are
+    open at once so no single block covers both -- is scored as good as
+    lost (`W_ESCAPE_LOSS`), not as a mild nuisance.  Without this a 1-ply
+    attacker up on material prefers "keep playing" over a repetition draw
+    even when its only non-losing move *is* the draw.  "manhattan" keeps
+    the legacy flat penalty.
     """
     if state.result is not None:
         w = state.result.winner
         if w is None:
             return 0.0
         return W_WIN if w == ATT else -W_WIN
+    threats = king_escape_threats(state)
+    if king_metric == "moves":
+        corner_moves, free = king_reach(state)
+        dist = W_KING_MOVES * corner_moves - W_KING_FREE * free
+        if threats and (state.to_move == DEF or threats >= 2):
+            threat_pen = W_ESCAPE_LOSS
+        else:
+            threat_pen = W_ESCAPE_THREAT * threats
+    elif king_metric == "manhattan":
+        dist = W_KING_DIST * king_corner_distance(state)
+        threat_pen = W_ESCAPE_THREAT * threats
+    else:
+        raise ValueError(f"unknown king_metric {king_metric!r}")
     return (W_ATTACKER * len(state.atts)
             - W_DEFENDER * len(state.defs)
-            + W_KING_DIST * king_corner_distance(state)
-            - W_ESCAPE_THREAT * king_escape_threats(state))
+            + dist
+            - threat_pen)
 
 
 class HeuristicAgent(Agent):
     """1-ply greedy search over `heuristic_value`.
 
     Fixed reference opponent: it never changes, so scores against it are
-    comparable across the whole training run.
+    comparable across the whole training run.  `king_metric` selects the
+    king-distance term ("moves" or "manhattan", see `heuristic_value`);
+    scores are only comparable within one metric.
     """
 
     def __init__(self, name: str = "heuristic", move_limit: int = MOVE_LIMIT,
-                 **kw):
+                 king_metric: str = "moves", **kw):
         super().__init__(name=name, **kw)
         self.move_limit = move_limit
+        if king_metric not in KING_METRICS:
+            raise ValueError(f"unknown king_metric {king_metric!r}")
+        self.king_metric = king_metric
 
     def _choose(self, state, acts, temperature):
         sign = 1.0 if state.to_move == ATT else -1.0
         scores = np.array(
-            [sign * heuristic_value(apply(state, int(a), self.move_limit))
+            [sign * heuristic_value(apply(state, int(a), self.move_limit),
+                                    self.king_metric)
              for a in acts], dtype=np.float64)
         # tiny jitter so equal-scoring moves are not always the same one
         scores += self.rng.random(len(scores)) * 1e-3
@@ -367,6 +470,8 @@ def describe_spec(s: dict) -> str:
         bits.append(f"{int(s.get('sims', 0))}sims")
     else:
         bits.append(kind)
+    if kind == "heuristic" and s.get("king_metric", "moves") != "moves":
+        bits.append(s["king_metric"])
     if s.get("temperature", 0.0) >= 0.05:
         bits.append(f"T{s['temperature']:g}")
     if s.get("randomness", 0.0) > 0.0:
@@ -392,7 +497,9 @@ def make_agent(s: dict, models_dir="models", rng=None, device=None,
         return RandomAgent(rng=rng, name=common["name"],
                            temperature=common["temperature"])
     if kind == "heuristic":
-        return HeuristicAgent(move_limit=move_limit, **common)
+        return HeuristicAgent(move_limit=move_limit,
+                              king_metric=s.get("king_metric", "moves"),
+                              **common)
     ckpt = s.get("checkpoint")
     if not ckpt:
         raise ValueError(f"spec {s!r} needs a checkpoint")

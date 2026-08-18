@@ -19,8 +19,11 @@ from tafl.agents import (ATT, DEF, HeuristicAgent, Levels, MCTSAgent,
                          PolicyAgent, RandomAgent, build_levels,
                          clear_evaluator_cache, default_levels, describe_spec,
                          heuristic_value, king_corner_distance,
-                         king_escape_threats, list_checkpoints, load_levels,
-                         make_agent, side_id, side_name, spec)
+                         king_corner_moves, king_escape_threats,
+                         list_checkpoints, load_levels, make_agent, side_id,
+                         side_name, spec)
+from tafl.agents import (KING_TRAPPED, W_KING_DIST, W_KING_MOVES,
+                         king_free_squares)
 from tafl.calibrate import (CalibrationConfig, build_jobs, calibrate,
                             candidate_pool, format_table, margins,
                             panel_specs, select_ladder, spread_checkpoints,
@@ -84,8 +87,92 @@ def test_start_position_is_materially_even():
     term must be zero there (defenders weighted double)."""
     st = initial_state()
     assert king_corner_distance(st) == 10
+    assert king_corner_moves(st) == KING_TRAPPED   # king walled in by defenders
     assert king_escape_threats(st) == 0
-    assert heuristic_value(st) == pytest.approx(0.35 * 10)
+    assert heuristic_value(st) == pytest.approx(W_KING_MOVES * KING_TRAPPED)
+    assert heuristic_value(st, "manhattan") == pytest.approx(W_KING_DIST * 10)
+
+
+def test_king_corner_moves_sees_blockades():
+    # open top row: one move to either corner
+    st = board({(0, 5): "K"}, DEF)
+    assert king_corner_moves(st) == 1
+    # both top-row rays blocked: drop to the bottom row, then into a corner
+    st = board({(0, 5): "K", (0, 2): "A", (0, 8): "A"}, DEF)
+    assert king_corner_moves(st) == 2
+    # walled in completely: charged the trapped cap
+    st = board({(0, 5): "K", (0, 4): "A", (0, 6): "A", (1, 5): "A"}, DEF)
+    assert king_corner_moves(st) == KING_TRAPPED
+    # standing on a corner costs nothing
+    won = board({(2, 0): "K", (9, 9): "A"}, DEF)
+    assert king_corner_moves(apply(won, make_action(sq(2, 0), sq(0, 0)))) == 0
+
+
+def test_king_free_squares_measures_the_cage():
+    # the start position boxes the king in with its own defenders
+    assert king_free_squares(initial_state()) == 0
+    # a sealed pocket on the k-file: k7, k5, k4 and j6 are reachable
+    st = board({(5, 10): "K", (3, 10): "A", (8, 10): "A", (4, 9): "A",
+                (5, 8): "A", (6, 9): "A", (7, 9): "A"}, DEF)
+    assert king_free_squares(st) == 4
+    assert king_corner_moves(st) == KING_TRAPPED
+
+
+def test_tighter_cage_scores_higher_for_the_attacker():
+    """Two sealed traps, identical material, corner distance saturated at
+    KING_TRAPPED in both: the only difference is one square of king room.
+    The cage term must prefer the tighter trap -- this is the gradient the
+    trapped-king endgame otherwise lacks (observed: an attacker up 16
+    pieces against a bare king shuffled aimlessly among ~180 equally
+    scored moves and let the king out)."""
+    tight = board({(5, 10): "K", (3, 10): "A", (8, 10): "A", (4, 9): "A",
+                   (5, 8): "A", (6, 9): "A", (7, 9): "A",
+                   (10, 5): "A"}, DEF)
+    roomy = board({(5, 10): "K", (3, 10): "A", (9, 10): "A", (4, 9): "A",
+                   (5, 8): "A", (6, 9): "A", (7, 9): "A",
+                   (8, 9): "A"}, DEF)
+    assert king_corner_moves(tight) == king_corner_moves(roomy) == KING_TRAPPED
+    assert king_free_squares(tight) == 4 and king_free_squares(roomy) == 5
+    assert heuristic_value(tight) > heuristic_value(roomy)
+    # the legacy metric cannot tell them apart
+    assert heuristic_value(tight, "manhattan") == pytest.approx(
+        heuristic_value(roomy, "manhattan"))
+
+
+def test_attacker_prefers_repetition_draw_over_allowing_escape():
+    """Regression for an observed game: king shuttles a9/k9 while the lone
+    useful attacker shuttles a10/k10 blocking whichever corner file opens.
+    The third block repeats the position, so it is an immediate draw -- and
+    the "moves" attacker must take that draw, because every other move
+    leaves the defender to move with an open corner (a lost game, scored
+    `W_ESCAPE_LOSS`).  The legacy heuristic sees only a -6 nuisance against
+    its +8 material edge, plays on, and loses; that observed blunder is
+    pinned here as the metrics' distinguishing behavior."""
+    st = board({(1, 5): "A", (3, 10): "A", (2, 10): "K",
+                (5, 2): "A", (5, 4): "A", (6, 3): "A",
+                (7, 2): "A", (7, 4): "A", (8, 3): "A"}, ATT)
+    shuttle = [((1, 5), (1, 10)), ((2, 10), (2, 0)),   # block k-file; k9-a9
+               ((1, 10), (1, 0)), ((2, 0), (2, 10)),   # block a-file; a9-k9
+               ((1, 0), (1, 10)), ((2, 10), (2, 0)),
+               ((1, 10), (1, 0)), ((2, 0), (2, 10))]
+    for f, t in shuttle:
+        st = apply(st, make_action(sq(*f), sq(*t)))
+    assert st.result is None
+    block = make_action(sq(1, 0), sq(1, 10))
+    assert apply(st, block).result == (None, "repetition")
+    new = HeuristicAgent(rng=rng())
+    old = HeuristicAgent(rng=rng(), king_metric="manhattan")
+    assert new.select_action(st) == block     # accepts the draw
+    assert old.select_action(st) != block     # the observed blunder
+
+
+def test_heuristic_attacker_blocks_the_kings_road():
+    """The 1-ply heuristic must spend a move closing the king's only open
+    corner path (the attacker on h9 is the only piece that can reach it)."""
+    st = board({(0, 5): "K", (0, 2): "A", (2, 7): "A"}, ATT)
+    blocking = make_action(sq(2, 7), sq(0, 7))
+    a = HeuristicAgent(rng=rng())
+    assert a.select_action(st) == blocking
 
 
 def test_escape_threats_counted_per_open_corner():

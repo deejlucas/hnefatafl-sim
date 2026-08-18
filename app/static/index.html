@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hnefatafl</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <section id="board-wrap">
+    <div id="board-grid">
+      <div id="rank-labels"></div>
+      <div id="board"></div>
+      <div></div>
+      <div id="file-labels"></div>
+    </div>
+  </section>
+
+  <aside id="panel">
+    <h1>Hnefatafl <span class="sub">Fetlar 11&times;11</span></h1>
+
+    <div class="card" id="setup">
+      <label>Attackers
+        <select id="att-select"></select>
+      </label>
+      <label>Defenders
+        <select id="def-select"></select>
+      </label>
+      <button id="new-game" class="primary">New game</button>
+    </div>
+
+    <div class="card" id="status-card">
+      <div id="status">&mdash;</div>
+      <div id="counts"></div>
+      <div class="row">
+        <button id="undo">Undo</button>
+        <button id="ai-step" title="Ask the AI to move now (AI vs AI)">AI step</button>
+        <label class="auto"><input type="checkbox" id="auto-ai" checked> auto AI</label>
+      </div>
+      <div id="error"></div>
+    </div>
+
+    <div class="card grow">
+      <h2>Moves</h2>
+      <ol id="move-log"></ol>
+    </div>
+  </aside>
+</main>
+<script src="board.js"></script>
+</body>
+</html>
